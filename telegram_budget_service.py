@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -9,9 +9,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib import error, parse, request
+from urllib import parse, request
 
-from storage import DATE_FORMAT, DEFAULT_CATEGORIES, add_record, compute_totals, delete_record, load_records, save_records
+from storage import DATE_FORMAT, DEFAULT_CATEGORIES, SAVINGS_CATEGORY, add_record, compute_totals, delete_record, load_records, save_records
 
 
 PORT = int(os.getenv("PORT", "8080"))
@@ -20,6 +20,7 @@ API_TOKEN = os.getenv("BUDGET_API_TOKEN", "").strip()
 ALLOWED_CHAT_ID = os.getenv("TELEGRAM_ALLOWED_CHAT_ID", "").strip()
 DATA_FILE = Path(os.getenv("BUDGET_DATA_FILE", str(Path("data") / "budget_data.json"))).resolve()
 PUBLIC_BASE_URL = os.getenv("BUDGET_PUBLIC_BASE_URL", "").rstrip("/")
+SAVINGS_PREFIXES = ("отложила", "отложил", "отложено", "отложить")
 
 records_lock = threading.Lock()
 
@@ -153,10 +154,42 @@ def category_lookup() -> list[tuple[str, str]]:
     return sorted(rows, key=lambda item: len(item[1]), reverse=True)
 
 
+def parse_savings_shortcut(raw: str) -> dict[str, Any] | None:
+    lowered = raw.casefold()
+    for prefix in SAVINGS_PREFIXES:
+        prefix_with_space = prefix + " "
+        if not lowered.startswith(prefix_with_space):
+            continue
+        remainder = raw[len(prefix_with_space):].strip()
+        if not remainder:
+            raise ValueError("После слова 'отложила' укажите сумму. Пример: отложила 5000")
+        parts = remainder.split(maxsplit=1)
+        amount_token = parts[0].replace(",", ".")
+        try:
+            amount = float(amount_token)
+        except ValueError as exc:
+            raise ValueError("Не удалось распознать сумму. Пример: отложила 5000") from exc
+        note = parts[1].strip() if len(parts) > 1 else ""
+        if note.casefold() in {"на отпуск", "отпуск", "в отпуск"}:
+            note = ""
+        return {
+            "date": datetime.now().strftime(DATE_FORMAT),
+            "type": "Расход",
+            "category": SAVINGS_CATEGORY,
+            "amount": amount,
+            "note": note,
+        }
+    return None
+
+
 def parse_expense_or_income(text: str) -> dict[str, Any]:
     raw = " ".join(text.strip().split())
     if not raw:
         raise ValueError("Пустое сообщение.")
+
+    savings_record = parse_savings_shortcut(raw)
+    if savings_record is not None:
+        return savings_record
 
     lowered = raw.casefold()
     record_type = "Расход"
@@ -218,7 +251,8 @@ def summary_text(records: list[dict[str, Any]]) -> str:
     return (
         f"Доходы: {totals['income']:,.2f} ₽\n"
         f"Расходы: {totals['expense']:,.2f} ₽\n"
-        f"Баланс: {totals['balance']:,.2f} ₽"
+        f"Накопления: {totals['savings']:,.2f} ₽\n"
+        f"Свободно: {totals['balance']:,.2f} ₽"
     ).replace(",", " ")
 
 
@@ -230,7 +264,17 @@ def handle_message(chat_id: str, text: str) -> None:
     if clean.startswith("/"):
         command = clean.split()[0].split("@", 1)[0]
         if command in {"/start", "/help"}:
-            send_message(chat_id, "Команды:\n/help\n/categories\n/balance\n/month\n/last\n\nБыстрый ввод:\n2500 продукты\nрасход 1500 бензин\nдоход 50000 зарплата\nдоход 3000 подарок от бабушки")
+            send_message(
+                chat_id,
+                "Команды:\n/help\n/categories\n/balance\n/month\n/last\n\n"
+                "Быстрый ввод:\n"
+                "2500 продукты\n"
+                "расход 1500 бензин\n"
+                "доход 50000 зарплата\n"
+                "отложила 5000\n"
+                "отложила 7000 на отпуск\n"
+                "отложено 3000 подарок от себя",
+            )
             return
         if command == "/categories":
             lines = [f"{kind}: " + ", ".join(categories) for kind, categories in DEFAULT_CATEGORIES.items()]
@@ -263,7 +307,23 @@ def handle_message(chat_id: str, text: str) -> None:
 
     month = datetime.now().strftime("%Y-%m")
     totals = compute_totals(month_records(updated, month))
-    send_message(chat_id, (f"Записала: {record['type']} {record['amount']:.2f} ₽\nКатегория: {record['category']}\nКомментарий: {record['note'] or '-'}\n\nТекущий месяц {month}:\nДоходы: {totals['income']:,.2f} ₽\nРасходы: {totals['expense']:,.2f} ₽\nБаланс: {totals['balance']:,.2f} ₽").replace(",", " "))
+    if record["category"] == SAVINGS_CATEGORY:
+        intro = f"Отложила: {record['amount']:.2f} ₽"
+    else:
+        intro = f"Записала: {record['type']} {record['amount']:.2f} ₽"
+    send_message(
+        chat_id,
+        (
+            f"{intro}\n"
+            f"Категория: {record['category']}\n"
+            f"Комментарий: {record['note'] or '-'}\n\n"
+            f"Текущий месяц {month}:\n"
+            f"Доходы: {totals['income']:,.2f} ₽\n"
+            f"Расходы: {totals['expense']:,.2f} ₽\n"
+            f"Накопления: {totals['savings']:,.2f} ₽\n"
+            f"Свободно: {totals['balance']:,.2f} ₽"
+        ).replace(",", " ")
+    )
 
 
 def poll_updates() -> None:
