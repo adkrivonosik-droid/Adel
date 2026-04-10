@@ -1,0 +1,5 @@
+﻿{
+  "base_url": "https://your-budget-bot.up.railway.app",
+  "api_token": "paste-your-budget-api-token-here",
+  "timeout": 15
+}
